@@ -3467,6 +3467,64 @@ class TestModels(unittest.TestCase):
         self.assertEqual(ks.shape, (1, 1, 4, 32))
         self.assertEqual(vs.shape, (1, 1, 4, 32))
 
+    def test_gemma4_wrapper_emits_shared_kv_states(self):
+        """The multimodal gemma4.Model wrapper (what real gemma-4-*-it
+        checkpoints load as) must thread return_shared_kv_states through to its
+        language_model. Regression guard: the MTP loop targets the wrapper, but
+        the synthetic MTP tests use gemma4_text.Model directly, so without this
+        the wrapper path is untested."""
+        from mlx_lm.models import gemma4
+        from mlx_lm.models.cache import make_prompt_cache
+
+        model = gemma4.Model(
+            gemma4.ModelArgs(
+                model_type="gemma4",
+                vocab_size=256,
+                text_config={
+                    "model_type": "gemma4_text",
+                    "hidden_size": 64,
+                    "num_hidden_layers": 4,
+                    "intermediate_size": 128,
+                    "num_attention_heads": 4,
+                    "head_dim": 16,
+                    "global_head_dim": 16,
+                    "rms_norm_eps": 1e-6,
+                    "vocab_size": 256,
+                    "vocab_size_per_layer_input": 256,
+                    "num_key_value_heads": 2,
+                    "num_kv_shared_layers": 0,
+                    "hidden_size_per_layer_input": 0,
+                    "sliding_window": 64,
+                    "sliding_window_pattern": 4,
+                    "final_logit_softcapping": None,
+                    "layer_types": [
+                        "sliding_attention",
+                        "sliding_attention",
+                        "sliding_attention",
+                        "full_attention",
+                    ],
+                    "rope_parameters": {
+                        "full_attention": {"rope_theta": 1e4},
+                        "sliding_attention": {"rope_theta": 1e4},
+                    },
+                },
+            )
+        )
+        inp = mx.array([[1, 2, 3, 4]])
+        # Default path unchanged
+        out = model(inp, cache=make_prompt_cache(model))
+        self.assertEqual(out.shape, (1, 4, 256))
+        # Emission path through the wrapper
+        logits, hidden, shared = model(
+            inp, cache=make_prompt_cache(model), return_shared_kv_states=True
+        )
+        self.assertEqual(logits.shape, (1, 4, 256))
+        self.assertEqual(hidden.shape, (1, 4, 64))
+        self.assertEqual(set(shared.keys()), {"full_attention", "sliding_attention"})
+        # The MTP loop resolves the embedding through the wrapper this way:
+        embed = getattr(model, "language_model", model).model.embed_tokens
+        self.assertEqual(embed(mx.array([[1]])).shape, (1, 1, 64))
+
     def _build_mtp_pair(self, seed=0):
         """Build a matched Gemma 4 target + MTP drafter (synthetic, tiny)."""
         from mlx_lm.models import gemma4_assistant, gemma4_text

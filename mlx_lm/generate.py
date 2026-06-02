@@ -730,8 +730,11 @@ def mtp_speculative_generate_step(
 
     sampler = sampler or (lambda x: mx.argmax(x, axis=-1))
     # The drafter is fed the target's RAW token embedding (no embed_scale),
-    # matching the HF Gemma4Assistant candidate generator.
-    embed = model.model.embed_tokens
+    # matching the HF Gemma4Assistant candidate generator. Resolve the embedding
+    # through the multimodal wrapper if present (gemma4.Model wraps the text
+    # model as `.language_model`); fall back to the text model directly.
+    text_model = getattr(model, "language_model", model)
+    embed = text_model.model.embed_tokens
 
     quantize_cache_fn = functools.partial(
         maybe_quantize_kv_cache,
