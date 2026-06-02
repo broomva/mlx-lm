@@ -3406,6 +3406,67 @@ class TestModels(unittest.TestCase):
         self.assertEqual(last_hidden.shape, (B, 1, 2560))
         self.assertEqual(logits.shape, (B, 1, 262144))
 
+    def test_gemma4_emits_shared_kv_states(self):
+        """The Gemma 4 target can optionally emit (logits, last_hidden,
+        shared_kv_states) for MTP speculative decoding. The default path
+        (flag off) must return logits unchanged."""
+        from mlx_lm.models import gemma4_text
+        from mlx_lm.models.cache import make_prompt_cache
+
+        args = gemma4_text.ModelArgs(
+            model_type="gemma4_text",
+            hidden_size=128,
+            num_hidden_layers=10,
+            intermediate_size=256,
+            num_attention_heads=4,
+            head_dim=32,
+            global_head_dim=64,
+            rms_norm_eps=1e-6,
+            vocab_size=1000,
+            vocab_size_per_layer_input=1000,
+            num_key_value_heads=1,
+            num_kv_shared_layers=4,
+            hidden_size_per_layer_input=32,
+            sliding_window=8,
+            sliding_window_pattern=5,
+            final_logit_softcapping=30.0,
+            layer_types=(
+                ["sliding_attention"] * 4
+                + ["full_attention"]
+                + ["sliding_attention"] * 4
+                + ["full_attention"]
+            ),
+            rope_parameters={
+                "full_attention": {
+                    "partial_rotary_factor": 0.25,
+                    "rope_theta": 1000000.0,
+                },
+                "sliding_attention": {"rope_theta": 10000.0},
+            },
+        )
+        model = gemma4_text.Model(args)
+        inputs = mx.array([[1, 2, 3, 4]])
+
+        # Default path — unchanged
+        out_default = model(inputs, cache=make_prompt_cache(model))
+        self.assertEqual(out_default.shape, (1, 4, 1000))
+
+        # Emission path
+        logits, last_hidden, shared = model(
+            inputs, cache=make_prompt_cache(model), return_shared_kv_states=True
+        )
+        # logits must be identical to the default path (same fresh cache)
+        self.assertTrue(mx.allclose(out_default, logits, atol=1e-5))
+        self.assertEqual(last_hidden.shape, (1, 4, 128))
+        self.assertEqual(set(shared.keys()), {"full_attention", "sliding_attention"})
+        # Full-attention layers use global_head_dim (64); sliding use head_dim (32)
+        kf, vf = shared["full_attention"]
+        ks, vs = shared["sliding_attention"]
+        self.assertEqual(kf.shape, (1, 1, 4, 64))
+        self.assertEqual(vf.shape, (1, 1, 4, 64))
+        self.assertEqual(ks.shape, (1, 1, 4, 32))
+        self.assertEqual(vs.shape, (1, 1, 4, 32))
+
 
 if __name__ == "__main__":
     unittest.main()

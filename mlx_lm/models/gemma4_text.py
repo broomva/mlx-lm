@@ -520,6 +520,7 @@ class Gemma4TextModel(nn.Module):
         cache=None,
         input_embeddings: Optional[mx.array] = None,
         per_layer_inputs: Optional[mx.array] = None,
+        return_shared_kv_states: bool = False,
     ):
         # Make the initial hidden state
         if input_embeddings is None:
@@ -572,7 +573,21 @@ class Gemma4TextModel(nn.Module):
 
             intermediates[idx] = (kvs, offset)
 
-        return self.norm(h)
+        h = self.norm(h)
+
+        if return_shared_kv_states:
+            # Expose the (keys, values) of the last layer of each attention
+            # type so an MTP drafter (see models/gemma4_assistant.py) can
+            # cross-attend to the target's context instead of recomputing it.
+            # Iterating forward and overwriting per layer_type leaves the
+            # last layer of each type as the winner — matching the HF
+            # Gemma4Assistant `shared_kv_states` contract.
+            shared_kv_states = {}
+            for idx, layer in enumerate(self.layers):
+                shared_kv_states[layer.layer_type] = intermediates[idx][0]
+            return h, shared_kv_states
+
+        return h
 
 
 class Model(nn.Module):
@@ -592,20 +607,30 @@ class Model(nn.Module):
         cache=None,
         input_embeddings: Optional[mx.array] = None,
         per_layer_inputs: Optional[mx.array] = None,
+        return_shared_kv_states: bool = False,
     ):
         out = self.model(
             inputs,
             cache=cache,
             input_embeddings=input_embeddings,
             per_layer_inputs=per_layer_inputs,
+            return_shared_kv_states=return_shared_kv_states,
         )
-        if self.tie_word_embeddings:
-            out = self.model.embed_tokens.as_linear(out)
+        if return_shared_kv_states:
+            last_hidden, shared_kv_states = out
         else:
-            out = self.lm_head(out)
+            last_hidden = out
+        if self.tie_word_embeddings:
+            logits = self.model.embed_tokens.as_linear(last_hidden)
+        else:
+            logits = self.lm_head(last_hidden)
         if self.final_logit_softcapping is not None:
-            out = logit_softcap(self.final_logit_softcapping, out)
-        return out
+            logits = logit_softcap(self.final_logit_softcapping, logits)
+        if return_shared_kv_states:
+            # logits → verify/sample; last_hidden → MTP drafter input;
+            # shared_kv_states → MTP drafter cross-attention.
+            return logits, last_hidden, shared_kv_states
+        return logits
 
     def sanitize(self, weights):
         sanitized = {}
