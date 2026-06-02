@@ -753,6 +753,12 @@ def mtp_speculative_generate_step(
         # length stays within the target's sliding window (the common drafting
         # regime). Correctness of the *output* does not depend on this trim —
         # only the drafter's acceptance rate (i.e. the speedup) does.
+        #
+        # Note: HF's reference trims to ``accepted_len + 1`` (its last shared-K
+        # slot holds the first *rejected* draft's K, an approximation since the
+        # bonus token's own K is never computed). We trim to ``accepted_len``
+        # (last *accepted* token's K). Both are output-neutral; this differs by
+        # one position and only nudges the acceptance rate.
         return {
             lt: (k[..., :length, :], v[..., :length, :])
             for lt, (k, v) in shared_kv.items()
@@ -871,7 +877,12 @@ def mtp_speculative_generate_step(
             target_hidden = vhidden[:, n : n + 1, :]
             cur_shared = _trim_shared_kv(vshared, accepted_len)
     finally:
-        pass
+        # Trim any unconsumed draft K/V left in the cache when the loop exits
+        # early (max_tokens break, EOS .close(), exception) so a caller-supplied
+        # prompt_cache is left clean for reuse — mirrors speculative_generate_step.
+        # The generator always suspends at a yield before the in-loop trim above,
+        # so this never double-trims a completed round.
+        cache.trim_prompt_cache(model_cache, num_draft - n)
 
 
 def stream_generate(

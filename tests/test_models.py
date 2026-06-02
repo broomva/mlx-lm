@@ -3624,6 +3624,67 @@ class TestModels(unittest.TestCase):
             from_draft, [False, True, True, True] * (max_tokens // 4) + [False]
         )
 
+    def test_mtp_threads_target_state(self):
+        """The loop must feed the drafter the *correct* target state. A spy
+        records each drafter call and asserts the target hidden + per-layer-type
+        shared_kv are real (non-zero), correctly shaped, and length-aligned with
+        the constant draft position. Bit-equivalence alone cannot catch broken
+        state threading (garbage state → all drafts rejected → still bit-equal),
+        so this is the test that protects the threading invariant."""
+        from mlx_lm.generate import is_mtp_drafter, mtp_speculative_generate_step
+
+        target, real_drafter, _ = self._build_mtp_pair(seed=2)
+        H = 64  # backbone (= target) hidden size
+
+        class Spy(nn.Module):
+            def __init__(self, inner):
+                super().__init__()
+                self.pre_projection = inner.pre_projection
+                self.post_projection = inner.post_projection
+                self.inner = inner
+                self.records = []
+
+            def __call__(
+                self, inputs_embeds, shared_kv_states, position_ids=None, mask=None
+            ):
+                kf = shared_kv_states["full_attention"][0]
+                self.records.append(
+                    {
+                        "in_dim": inputs_embeds.shape[-1],
+                        "in_nonzero": bool(mx.any(inputs_embeds != 0).item()),
+                        "keys": set(shared_kv_states.keys()),
+                        "full_seq": int(kf.shape[-2]),
+                        "full_k_nonzero": bool(mx.any(kf != 0).item()),
+                        "pos": int(position_ids.reshape(-1)[-1].item()),
+                    }
+                )
+                return self.inner(inputs_embeds, shared_kv_states, position_ids, mask)
+
+        spy = Spy(real_drafter)
+        self.assertTrue(is_mtp_drafter(spy))
+        prompt = mx.array([1, 5, 9, 13, 2, 7], dtype=mx.uint32)
+        list(
+            mtp_speculative_generate_step(
+                prompt, target, spy, num_draft_tokens=3, max_tokens=16
+            )
+        )
+
+        self.assertGreater(len(spy.records), 0)
+        for r in spy.records:
+            # inputs_embeds = concat(token_embed, target_hidden) = 2 * backbone
+            self.assertEqual(r["in_dim"], 2 * H)
+            self.assertTrue(r["in_nonzero"])  # target hidden actually threaded
+            self.assertTrue(r["full_k_nonzero"])  # real target K, not zeros
+            self.assertEqual(r["keys"], {"full_attention", "sliding_attention"})
+            # shared_kv length == draft position == accepted context length
+            self.assertEqual(r["full_seq"], r["pos"])
+            self.assertGreaterEqual(r["pos"], int(prompt.size))
+
+        # The draft position advances across rounds (state moves forward).
+        positions = [r["pos"] for r in spy.records]
+        self.assertEqual(positions, sorted(positions))
+        self.assertGreater(positions[-1], positions[0])
+
 
 if __name__ == "__main__":
     unittest.main()
