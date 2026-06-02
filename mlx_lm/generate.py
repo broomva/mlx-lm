@@ -729,12 +729,17 @@ def mtp_speculative_generate_step(
         )
 
     sampler = sampler or (lambda x: mx.argmax(x, axis=-1))
-    # The drafter is fed the target's RAW token embedding (no embed_scale),
-    # matching the HF Gemma4Assistant candidate generator. Resolve the embedding
-    # through the multimodal wrapper if present (gemma4.Model wraps the text
-    # model as `.language_model`); fall back to the text model directly.
+    # The drafter is fed the target's token embedding *scaled by embed_scale*
+    # (concat'd with the target hidden state). The target keeps its hidden
+    # activations in the embed_scale regime (h = embed(x) * embed_scale), and
+    # the drafter's pre_projection was trained on that scale — feeding the raw
+    # (unscaled) embedding leaves the embedding component ~embed_scale× too
+    # small and the drafter predicts garbage (≈0% acceptance). Resolve through
+    # the multimodal wrapper if present (gemma4.Model wraps the text model as
+    # `.language_model`); fall back to the text model directly.
     text_model = getattr(model, "language_model", model)
     embed = text_model.model.embed_tokens
+    embed_scale = getattr(text_model.model, "embed_scale", 1.0)
 
     quantize_cache_fn = functools.partial(
         maybe_quantize_kv_cache,
@@ -776,7 +781,7 @@ def mtp_speculative_generate_step(
         hid = target_hidden  # (1, 1, H_target)
         drafts = []
         for _ in range(n_draft):
-            inputs_embeds = mx.concatenate([embed(tok), hid], axis=-1)
+            inputs_embeds = mx.concatenate([embed(tok) * embed_scale, hid], axis=-1)
             hid, dlogits = draft_model(inputs_embeds, shared_kv, position_ids=pos)
             tok = mx.argmax(dlogits[:, -1, :], axis=-1, keepdims=True).astype(mx.uint32)
             drafts.append(tok)
