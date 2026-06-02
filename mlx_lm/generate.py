@@ -654,6 +654,226 @@ def speculative_generate_step(
         _rewind_cache(num_draft, n)
 
 
+def is_mtp_drafter(draft_model: nn.Module) -> bool:
+    """True if ``draft_model`` is a Multi-Token-Prediction drafter.
+
+    Duck-typed on the MTP contract (a ``pre_projection`` that ingests the
+    target's hidden state and a ``__call__`` that consumes ``shared_kv_states``)
+    rather than importing a concrete model class, so generate.py stays
+    decoupled from any specific model module.
+    """
+    return hasattr(draft_model, "pre_projection") and hasattr(
+        draft_model, "post_projection"
+    )
+
+
+def mtp_speculative_generate_step(
+    prompt: mx.array,
+    model: nn.Module,
+    draft_model: nn.Module,
+    *,
+    num_draft_tokens: int = 2,
+    max_tokens: int = 256,
+    sampler: Optional[Callable[[mx.array], mx.array]] = None,
+    logits_processors: Optional[List[Callable[[mx.array, mx.array], mx.array]]] = None,
+    prompt_cache: Optional[Any] = None,
+    prefill_step_size: int = 512,
+    kv_bits: Optional[int] = None,
+    kv_group_size: int = 64,
+    quantized_kv_start: int = 0,
+) -> Generator[Tuple[mx.array, mx.array, bool], None, None]:
+    """Speculative decoding with a Multi-Token-Prediction (MTP) drafter.
+
+    Unlike standard speculative decoding, the MTP drafter owns no KV cache:
+    each draft step it cross-attends to the target's per-layer-type K/V
+    (``shared_kv_states``) and consumes the target's last hidden state, drafting
+    from a constant position. The target must support the
+    ``return_shared_kv_states=True`` forward (see ``models/gemma4_text.py``) and
+    the drafter must follow the ``models/gemma4_assistant.py`` contract.
+
+    The yielded output is identical to non-speculative generation from the
+    target — the drafter only changes latency, never the tokens.
+
+    Args:
+        prompt (mx.array): The input prompt.
+        model (nn.Module): The target model (must emit ``shared_kv_states``).
+        draft_model (nn.Module): The MTP drafter.
+        num_draft_tokens (int): Tokens to draft per step. Default: ``2``.
+        max_tokens (int): Maximum tokens to generate. ``-1`` for infinite.
+        sampler (Callable, optional): Sampler over log-probabilities.
+        logits_processors (List[Callable], optional): Logit transforms.
+        prompt_cache (List[Any], optional): Pre-computed *target* prompt cache,
+          updated in place. Must be trimmable.
+        prefill_step_size (int): Prompt prefill chunk size.
+        kv_bits (int, optional): KV cache quantization bits.
+        kv_group_size (int): KV cache quantization group size.
+        quantized_kv_start (int): Step to begin quantizing the KV cache.
+
+    Yields:
+        Tuple[mx.array, mx.array, bool]: token, log-probabilities, and whether
+          the token came from the drafter.
+    """
+    y = prompt.astype(mx.uint32)
+
+    # Only the target owns a KV cache; the MTP drafter cross-attends to the
+    # target's shared_kv_states, so make_cache() on it raises by design.
+    if prompt_cache is None:
+        model_cache = cache.make_prompt_cache(model)
+    else:
+        model_cache = prompt_cache
+
+    if not cache.can_trim_prompt_cache(model_cache):
+        types = {type(c).__name__ for c in model_cache if not c.is_trimmable()}
+        raise ValueError(
+            f"Speculative decoding requires a trimmable prompt cache (got {types})."
+        )
+
+    sampler = sampler or (lambda x: mx.argmax(x, axis=-1))
+    # The drafter is fed the target's RAW token embedding (no embed_scale),
+    # matching the HF Gemma4Assistant candidate generator.
+    embed = model.model.embed_tokens
+
+    quantize_cache_fn = functools.partial(
+        maybe_quantize_kv_cache,
+        quantized_kv_start=quantized_kv_start,
+        kv_group_size=kv_group_size,
+        kv_bits=kv_bits,
+    )
+
+    def _sample(logits, prev):
+        if logits_processors:
+            for processor in logits_processors:
+                logits = processor(prev, logits)
+        logprobs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
+        return sampler(logprobs), logprobs
+
+    def _trim_shared_kv(shared_kv, length):
+        # Front-slice to the accepted length. Exact for full-attention layers
+        # (positional order) and for sliding-attention layers while the context
+        # length stays within the target's sliding window (the common drafting
+        # regime). Correctness of the *output* does not depend on this trim —
+        # only the drafter's acceptance rate (i.e. the speedup) does.
+        return {
+            lt: (k[..., :length, :], v[..., :length, :])
+            for lt, (k, v) in shared_kv.items()
+        }
+
+    def _draft(last_token, target_hidden, shared_kv, position, n_draft):
+        """Autoregressively draft ``n_draft`` tokens from a constant position."""
+        if n_draft == 0:
+            return []
+        pos = mx.array([[position]])
+        tok = last_token.reshape(1, 1)  # (B=1, 1)
+        hid = target_hidden  # (1, 1, H_target)
+        drafts = []
+        for _ in range(n_draft):
+            inputs_embeds = mx.concatenate([embed(tok), hid], axis=-1)
+            hid, dlogits = draft_model(inputs_embeds, shared_kv, position_ids=pos)
+            tok = mx.argmax(dlogits[:, -1, :], axis=-1, keepdims=True).astype(mx.uint32)
+            drafts.append(tok)
+            mx.async_eval(tok)
+        return drafts
+
+    # --- Prefill the target on all but the last prompt token ---
+    with mx.stream(generation_stream):
+        while y.size > 1:
+            n = min(prefill_step_size, y.size - 1)
+            model(y[:n][None], cache=model_cache)
+            quantize_cache_fn(model_cache)
+            mx.eval([c.state for c in model_cache])
+            y = y[n:]
+            mx.clear_cache()
+
+    # --- Seed: run the target on the last prompt token to get the first
+    #     token plus the hidden/KV the drafter needs ---
+    with mx.stream(generation_stream):
+        logits, hidden, shared_kv = model(
+            y[None], cache=model_cache, return_shared_kv_states=True
+        )
+        quantize_cache_fn(model_cache)
+        tok, lp = _sample(logits[:, -1, :], None)
+        mx.eval(tok)
+
+    ntoks = 0
+    accepted_len = int(prompt.size)  # tokens whose K/V is in the cache
+    last_token = tok.reshape(1)
+    target_hidden = hidden[:, -1:, :]
+    cur_shared = _trim_shared_kv(shared_kv, accepted_len)
+
+    ntoks += 1
+    yield int(last_token.item()), lp.squeeze(0), False
+    if ntoks == max_tokens:
+        return
+
+    num_draft = 0
+    n = 0
+    try:
+        while True:
+            num_draft = min(num_draft_tokens, max(max_tokens - ntoks, 0))
+            position = accepted_len  # constant for the whole draft round
+            drafts = _draft(last_token, target_hidden, cur_shared, position, num_draft)
+            draft_arr = (
+                mx.concatenate([d.reshape(1) for d in drafts])
+                if drafts
+                else mx.array([], mx.uint32)
+            )
+
+            # Verify: target processes [last_token, draft_1..draft_k]
+            verify_in = mx.concatenate([last_token, draft_arr])
+            with mx.stream(generation_stream):
+                vlogits, vhidden, vshared = model(
+                    verify_in[None], cache=model_cache, return_shared_kv_states=True
+                )
+                quantize_cache_fn(model_cache)
+            vlogits = vlogits[:, -(num_draft + 1) :, :]
+
+            mx.eval(vlogits, draft_arr)
+            draft_list = draft_arr.tolist()
+
+            # Accept the matching prefix; emit the bonus token at the first miss.
+            n = 0
+            new_last = None
+            while n < num_draft:
+                ttok, tlp = _sample(vlogits[:, n, :], None)
+                ttok_i = int(ttok.item())
+                if ttok_i != draft_list[n]:
+                    new_last = ttok
+                    new_lp = tlp
+                    break
+                n += 1
+                ntoks += 1
+                yield draft_list[n - 1], tlp.squeeze(0), True
+                if ntoks == max_tokens:
+                    new_last = None
+                    break
+            else:
+                # all drafts accepted → bonus token is the prediction at pos num_draft
+                pass
+
+            if ntoks == max_tokens:
+                break
+
+            if new_last is None:
+                # either all accepted, or hit max_tokens mid-accept (handled above)
+                bonus, blp = _sample(vlogits[:, n, :], None)
+                new_last, new_lp = bonus, blp
+
+            ntoks += 1
+            yield int(new_last.item()), new_lp.squeeze(0), False
+            if ntoks == max_tokens:
+                break
+
+            # --- Advance state for the next round ---
+            # Cache grew by (num_draft + 1); accepted = n drafts + 1 bonus.
+            cache.trim_prompt_cache(model_cache, num_draft - n)
+            accepted_len = accepted_len + n + 1
+            last_token = new_last.reshape(1)
+            target_hidden = vhidden[:, n : n + 1, :]
+            cur_shared = _trim_shared_kv(vshared, accepted_len)
+    finally:
+        pass
+
+
 def stream_generate(
     model: nn.Module,
     tokenizer: Union[PreTrainedTokenizer, TokenizerWrapper],
@@ -708,9 +928,14 @@ def stream_generate(
     else:
         kwargs.pop("max_kv_size", None)
         kwargs.pop("prompt_progress_callback", None)
-        token_generator = speculative_generate_step(
-            prompt, model, draft_model, **kwargs
-        )
+        if is_mtp_drafter(draft_model):
+            token_generator = mtp_speculative_generate_step(
+                prompt, model, draft_model, **kwargs
+            )
+        else:
+            token_generator = speculative_generate_step(
+                prompt, model, draft_model, **kwargs
+            )
     with wired_limit(model, [generation_stream]):
         tic = time.perf_counter()
         for n, (token, logprobs, from_draft) in enumerate(token_generator):

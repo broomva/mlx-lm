@@ -3467,6 +3467,163 @@ class TestModels(unittest.TestCase):
         self.assertEqual(ks.shape, (1, 1, 4, 32))
         self.assertEqual(vs.shape, (1, 1, 4, 32))
 
+    def _build_mtp_pair(self, seed=0):
+        """Build a matched Gemma 4 target + MTP drafter (synthetic, tiny)."""
+        from mlx_lm.models import gemma4_assistant, gemma4_text
+
+        mx.random.seed(seed)
+        V, H, HD, KVH = 256, 64, 16, 2
+        target = gemma4_text.Model(
+            gemma4_text.ModelArgs(
+                model_type="gemma4_text",
+                hidden_size=H,
+                num_hidden_layers=4,
+                intermediate_size=128,
+                num_attention_heads=4,
+                head_dim=HD,
+                global_head_dim=HD,
+                rms_norm_eps=1e-6,
+                vocab_size=V,
+                vocab_size_per_layer_input=V,
+                num_key_value_heads=KVH,
+                num_kv_shared_layers=0,
+                hidden_size_per_layer_input=0,
+                sliding_window=64,
+                sliding_window_pattern=4,
+                final_logit_softcapping=None,
+                layer_types=[
+                    "sliding_attention",
+                    "sliding_attention",
+                    "sliding_attention",
+                    "full_attention",
+                ],
+                rope_parameters={
+                    "full_attention": {"rope_theta": 1e4},
+                    "sliding_attention": {"rope_theta": 1e4},
+                },
+            )
+        )
+        drafter = gemma4_assistant.Model(
+            gemma4_assistant.ModelArgs(
+                model_type="gemma4_assistant",
+                backbone_hidden_size=H,
+                num_centroids=4,
+                centroid_intermediate_top_k=2,
+                use_ordered_embeddings=False,
+                vocab_size=V,
+                text_config={
+                    "hidden_size": 48,
+                    "intermediate_size": 96,
+                    "num_hidden_layers": 2,
+                    "num_attention_heads": 6,
+                    "num_key_value_heads": KVH,
+                    "head_dim": HD,
+                    "global_head_dim": HD,
+                    "vocab_size": V,
+                    "rms_norm_eps": 1e-6,
+                    "max_position_embeddings": 128,
+                    "layer_types": ["sliding_attention", "full_attention"],
+                    "rope_parameters": {
+                        "full_attention": {"rope_theta": 1e4},
+                        "sliding_attention": {"rope_theta": 1e4},
+                    },
+                },
+            )
+        )
+        return target, drafter, V
+
+    def test_mtp_speculative_bit_equivalence(self):
+        """MTP speculative decoding must yield token-identical output to
+        non-speculative decoding from the target — the drafter only changes
+        latency, never the tokens."""
+        from mlx_lm.generate import (
+            generate_step,
+            is_mtp_drafter,
+            mtp_speculative_generate_step,
+        )
+
+        prompt = mx.array([1, 5, 9, 13, 2, 7, 3], dtype=mx.uint32)
+        max_tokens = 24
+        for seed in (0, 1, 3):
+            target, drafter, _ = self._build_mtp_pair(seed)
+            self.assertTrue(is_mtp_drafter(drafter))
+            ref = [
+                int(tok)
+                for (tok, _), _ in zip(
+                    generate_step(prompt, target, max_tokens=max_tokens),
+                    range(max_tokens),
+                )
+            ]
+            got = [
+                int(tok)
+                for tok, _, _ in mtp_speculative_generate_step(
+                    prompt, target, drafter, num_draft_tokens=4, max_tokens=max_tokens
+                )
+            ]
+            self.assertEqual(got, ref, f"bit-equivalence failed at seed={seed}")
+
+    def test_mtp_speculative_accept_path(self):
+        """A perfect (constant) drafter against a target forced to a constant
+        token exercises the all-accepted branch and stays bit-equivalent."""
+        from mlx_lm.generate import (
+            generate_step,
+            is_mtp_drafter,
+            mtp_speculative_generate_step,
+        )
+
+        target, _, V = self._build_mtp_pair(seed=1)
+        H, T = 64, 42
+
+        class ConstDrafter(nn.Module):
+            def __init__(self):
+                super().__init__()
+                # markers so is_mtp_drafter() detects this as an MTP drafter
+                self.pre_projection = nn.Linear(1, 1)
+                self.post_projection = nn.Linear(1, 1)
+
+            def __call__(
+                self, inputs_embeds, shared_kv_states, position_ids=None, mask=None
+            ):
+                b, l = inputs_embeds.shape[:2]
+                onehot = (mx.arange(V) == T).astype(mx.float32) * 1e9
+                return mx.zeros((b, l, H)), mx.broadcast_to(onehot, (b, l, V))
+
+        def force_T(tokens, logits):
+            return logits + (mx.arange(V) == T).astype(logits.dtype) * 1e9
+
+        drafter = ConstDrafter()
+        self.assertTrue(is_mtp_drafter(drafter))
+        prompt = mx.array([1, 5, 9, 13, 2], dtype=mx.uint32)
+        max_tokens = 13
+
+        ref = [
+            int(tok)
+            for (tok, _), _ in zip(
+                generate_step(
+                    prompt, target, max_tokens=max_tokens, logits_processors=[force_T]
+                ),
+                range(max_tokens),
+            )
+        ]
+        got, from_draft = [], []
+        for tok, _, fd in mtp_speculative_generate_step(
+            prompt,
+            target,
+            drafter,
+            num_draft_tokens=3,
+            max_tokens=max_tokens,
+            logits_processors=[force_T],
+        ):
+            got.append(int(tok))
+            from_draft.append(fd)
+
+        self.assertEqual(got, ref)
+        self.assertTrue(all(t == T for t in got))
+        # num_draft_tokens=3 → each round is 3 accepted drafts + 1 bonus
+        self.assertEqual(
+            from_draft, [False, True, True, True] * (max_tokens // 4) + [False]
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
