@@ -9,7 +9,14 @@ upstream merge status.
 
 ## Install
 
-Pin the validated tag (immutable — survives rebases on upstream `main`):
+From PyPI (published; coexists with upstream `mlx-lm`, import path stays `mlx_lm`):
+
+```bash
+pip install mlx-lm-broomva
+```
+
+Or as a drop-in replacement for `mlx-lm` from the fork — pin the validated,
+immutable tag (survives rebases on upstream `main`):
 
 ```bash
 pip install "git+https://github.com/broomva/mlx-lm.git@mtp-v0.1"

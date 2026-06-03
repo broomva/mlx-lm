@@ -33,13 +33,15 @@ file). A monkeypatch would have to replace that method wholesale and re-break on
 upstream change. The renamed fork carries the change in-tree, which is strictly more
 robust. Its only cost is periodic rebase on upstream `main` (same as channel 2).
 
-### Publish steps (requires a PyPI account + explicit go-ahead — DO NOT run unprompted)
+### Publishing — Trusted Publishing (OIDC), the default
+
+**No token or secret.** `.github/workflows/publish-pypi.yml` publishes via GitHub
+OIDC against a PyPI pending-publisher config (owner `broomva`, repo `mlx-lm`,
+workflow `publish-pypi.yml`, environment `pypi`). To cut a release:
 
 ```bash
-# on dist/broomva, with setup.py already renamed to mlx-lm-broomva:
-python -m build                      # builds sdist + wheel into dist/
-python -m twine check dist/*
-python -m twine upload dist/*        # needs PyPI credentials
+git checkout dist/broomva
+git tag pypi-v<version> && git push origin pypi-v<version>   # or Actions → publish-pypi → Run
 ```
 
 Then consumers:
@@ -48,6 +50,13 @@ Then consumers:
 pip install mlx-lm-broomva
 # import path stays `mlx_lm` (intentional — drop-in), so:
 #   from mlx_lm import load, stream_generate
+```
+
+### Fallback — manual upload (only if not using Actions)
+
+```bash
+python -m build && python -m twine check dist/*
+python -m twine upload dist/*        # needs a fresh project-scoped PyPI token
 ```
 
 ### Keeping the derivative current
@@ -61,4 +70,7 @@ git checkout dist/broomva && git rebase feat/gemma4-mtp-generate    # re-apply t
 ## Decision log
 - **2026-06-03** — fork made installable (`mtp-v0.1` tag + channel 2); PyPI rename
   prepared on `dist/broomva` (channel 3) and verified to build (`python -m build`).
-  Not published — awaiting a distribution decision. Tracked in BRO-1350.
+- **2026-06-03** — **`mlx-lm-broomva` 0.31.3 published to PyPI** via Trusted
+  Publishing (OIDC, no token). Validated: `pip install mlx-lm-broomva` in a fresh
+  venv ships the MTP code and imports as `mlx_lm`. Channel 3 is live.
+  https://pypi.org/project/mlx-lm-broomva/ — tracked in BRO-1350.
