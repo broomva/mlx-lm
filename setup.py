@@ -13,15 +13,20 @@ from _version import __version__
 MIN_MLX_VERSION = "0.31.2"
 
 setup(
-    name="mlx-lm",
+    # Broomva distribution fork — adds Gemma 4 Multi-Token-Prediction speculative
+    # decoding (gemma4_assistant + mtp_speculative_generate_step). Drop-in: the
+    # import path stays `mlx_lm`. See MTP-USAGE.md / RELEASING.md. Upstream PR:
+    # https://github.com/ml-explore/mlx-lm/pull/1276 — this rename is channel 3
+    # (PyPI derivative); prefer upstream merge or the git-install of the fork.
+    name="mlx-lm-broomva",
     version=__version__,
-    description="LLMs with MLX and the Hugging Face Hub",
+    description="mlx-lm + Gemma 4 multi-token-prediction speculative decoding (Broomva fork)",
     long_description=open("README.md", encoding="utf-8").read(),
     long_description_content_type="text/markdown",
     readme="README.md",
     author_email="mlx@group.apple.com",
-    author="MLX Contributors",
-    url="https://github.com/ml-explore/mlx-lm",
+    author="MLX Contributors, Broomva",
+    url="https://github.com/broomva/mlx-lm",
     license="MIT",
     install_requires=[
         f"mlx>={MIN_MLX_VERSION}; platform_system == 'Darwin'",
