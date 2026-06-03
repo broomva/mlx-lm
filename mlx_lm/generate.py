@@ -839,41 +839,40 @@ def mtp_speculative_generate_step(
                     verify_in[None], cache=model_cache, return_shared_kv_states=True
                 )
                 quantize_cache_fn(model_cache)
-            vlogits = vlogits[:, -(num_draft + 1) :, :]
+            vlogits = vlogits[:, -(num_draft + 1) :, :][0]  # (num_draft + 1, V)
 
-            mx.eval(vlogits, draft_arr)
+            # Sample ALL verification positions at once, then do the accept
+            # comparison in pure Python. This costs a single host sync per round
+            # (the `.tolist()`), instead of one `.item()` per draft position —
+            # the per-position syncs serialized the GPU and were the dominant
+            # source of MTP overhead (the drafter forward itself is only ~5% of
+            # a target forward).
+            if logits_processors:
+                for processor in logits_processors:
+                    vlogits = processor(None, vlogits)
+            vlogprobs = vlogits - mx.logsumexp(vlogits, axis=-1, keepdims=True)
+            vtokens = sampler(vlogprobs)  # (num_draft + 1,)
+            mx.eval(vtokens, draft_arr)
+            vtokens_list = vtokens.tolist()
             draft_list = draft_arr.tolist()
 
-            # Accept the matching prefix; emit the bonus token at the first miss.
+            # Accept the matching prefix (pure Python, no per-token sync).
             n = 0
-            new_last = None
-            while n < num_draft:
-                ttok, tlp = _sample(vlogits[:, n, :], None)
-                ttok_i = int(ttok.item())
-                if ttok_i != draft_list[n]:
-                    new_last = ttok
-                    new_lp = tlp
-                    break
-                n += 1
+            while n < num_draft and vtokens_list[n] == draft_list[n]:
                 ntoks += 1
-                yield draft_list[n - 1], tlp.squeeze(0), True
+                yield draft_list[n], vlogprobs[n], True
+                n += 1
                 if ntoks == max_tokens:
-                    new_last = None
                     break
-            else:
-                # all drafts accepted → bonus token is the prediction at pos num_draft
-                pass
 
             if ntoks == max_tokens:
                 break
 
-            if new_last is None:
-                # either all accepted, or hit max_tokens mid-accept (handled above)
-                bonus, blp = _sample(vlogits[:, n, :], None)
-                new_last, new_lp = bonus, blp
-
+            # Bonus token at position n (the first miss, or the extra slot if all
+            # drafts were accepted). vtokens_list[n] is always valid: n ranges in
+            # [0, num_draft] and vtokens has num_draft + 1 entries.
             ntoks += 1
-            yield int(new_last.item()), new_lp.squeeze(0), False
+            yield vtokens_list[n], vlogprobs[n], False
             if ntoks == max_tokens:
                 break
 
@@ -881,7 +880,7 @@ def mtp_speculative_generate_step(
             # Cache grew by (num_draft + 1); accepted = n drafts + 1 bonus.
             cache.trim_prompt_cache(model_cache, num_draft - n)
             accepted_len = accepted_len + n + 1
-            last_token = new_last.reshape(1)
+            last_token = mx.array([vtokens_list[n]], mx.uint32)
             target_hidden = vhidden[:, n : n + 1, :]
             cur_shared = _trim_shared_kv(vshared, accepted_len)
     finally:
